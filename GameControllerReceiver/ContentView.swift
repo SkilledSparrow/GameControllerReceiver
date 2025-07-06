@@ -13,7 +13,7 @@ struct ContentView: View {
     
     var body: some View {
         VStack(spacing: 20) {
-            Text("Game Controller Receiver")
+            Text("Game Controller Receiver (UDP)")
                 .font(.largeTitle)
                 .fontWeight(.bold)
             
@@ -45,7 +45,7 @@ struct ContentView: View {
                 Circle()
                     .fill(server.isRunning ? Color.green : Color.red)
                     .frame(width: 12, height: 12)
-                Text(server.isRunning ? "Server Running" : "Server Stopped")
+                Text(server.isRunning ? "UDP Server Running" : "UDP Server Stopped")
                 Spacer()
                 Text("Port: 12345")
                     .foregroundColor(.secondary)
@@ -54,9 +54,9 @@ struct ContentView: View {
             .background(Color.gray.opacity(0.1))
             .cornerRadius(8)
             
-            // Connected clients
+            // Connected clients and stats
             HStack {
-                Text("Connected Clients: \(server.connectedClients)")
+                Text("Active Clients: \(server.activeClients)")
                     .foregroundColor(.secondary)
                 Spacer()
                 Text("Messages/sec: \(server.messagesPerSecond)")
@@ -134,7 +134,7 @@ struct ContentView: View {
             Text("Instructions:")
                 .font(.headline)
             VStack(alignment: .leading, spacing: 5) {
-                Text("1. Start the server on your Mac")
+                Text("1. Start the UDP server on your Mac")
                 Text("2. Your Mac's IP addresses:")
                 ForEach(getLocalIPAddresses(), id: \.self) { ip in
                     Text("   • \(ip)")
@@ -146,6 +146,7 @@ struct ContentView: View {
                 Text("4. Connect from your iPhone")
                 Text("5. Customize key mappings above as needed")
                 Text("6. Single tap for one key press, long press for continuous")
+                Text("Note: UDP provides lower latency but no delivery guarantee")
             }
             .font(.caption)
             .foregroundColor(.secondary)
@@ -156,7 +157,7 @@ struct ContentView: View {
             checkAccessibilityPermission()
         }
         .onReceive(server.$lastReceivedButton) { button in
-            if !button.isEmpty {
+            if !button.isEmpty && button != "HEARTBEAT" {
                 receivedButtons.append(button)
                 if receivedButtons.count > 50 {
                     receivedButtons.removeFirst()
@@ -229,17 +230,21 @@ struct ContentView: View {
 
 class GameControllerServer: ObservableObject {
     @Published var isRunning = false
-    @Published var connectedClients = 0
+    @Published var activeClients = 0
     @Published var lastReceivedButton = ""
     @Published var messagesPerSecond = 0
     
     private var listener: NWListener?
-    private var connections: [NWConnection] = []
     private var keySimulationQueue = DispatchQueue(label: "keySimulation", qos: .userInitiated)
     
     // Message rate tracking
     private var messageCount = 0
     private var messageTimer: Timer?
+    
+    // Client tracking for UDP
+    private var clientAddresses: Set<String> = []
+    private var clientLastSeen: [String: Date] = [:]
+    private var clientCleanupTimer: Timer?
     
     init() {
         // Start message rate tracking
@@ -249,10 +254,16 @@ class GameControllerServer: ObservableObject {
                 self?.messageCount = 0
             }
         }
+        
+        // Start client cleanup timer
+        clientCleanupTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.cleanupInactiveClients()
+        }
     }
     
     deinit {
         messageTimer?.invalidate()
+        clientCleanupTimer?.invalidate()
     }
     
     func startServer() {
@@ -267,9 +278,9 @@ class GameControllerServer: ObservableObject {
         }
         
         do {
-            listener = try NWListener(using: .tcp, on: port)
+            listener = try NWListener(using: .udp, on: port)
         } catch {
-            print("Failed to create listener: \(error)")
+            print("Failed to create UDP listener: \(error)")
             return
         }
         
@@ -278,21 +289,21 @@ class GameControllerServer: ObservableObject {
                 switch state {
                 case .ready:
                     self?.isRunning = true
-                    print("✅ Server successfully started on port 12345")
+                    print("✅ UDP Server successfully started on port 12345")
                 case .failed(let error):
-                    print("❌ Server failed to start: \(error)")
+                    print("❌ UDP Server failed to start: \(error)")
                     self?.isRunning = false
                 case .cancelled:
-                    print("🛑 Server cancelled")
+                    print("🛑 UDP Server cancelled")
                     self?.isRunning = false
                 default:
-                    print("Server state: \(state)")
+                    print("UDP Server state: \(state)")
                 }
             }
         }
         
         listener?.newConnectionHandler = { [weak self] connection in
-            print("📱 New connection attempt from client")
+            print("📡 New UDP connection established")
             self?.handleNewConnection(connection)
         }
         
@@ -300,43 +311,33 @@ class GameControllerServer: ObservableObject {
     }
     
     func stopServer() {
-        print("🛑 Stopping server...")
+        print("🛑 Stopping UDP server...")
         listener?.cancel()
         listener = nil
         
-        connections.forEach { connection in
-            connection.cancel()
-        }
-        connections.removeAll()
+        clientAddresses.removeAll()
+        clientLastSeen.removeAll()
         
         DispatchQueue.main.async {
             self.isRunning = false
-            self.connectedClients = 0
-            print("✅ Server stopped successfully")
+            self.activeClients = 0
+            print("✅ UDP Server stopped successfully")
         }
     }
     
     private func handleNewConnection(_ connection: NWConnection) {
-        print("🔗 Handling new connection...")
-        connections.append(connection)
+        print("🔗 Handling new UDP connection...")
         
         connection.stateUpdateHandler = { [weak self] state in
-            DispatchQueue.main.async {
-                switch state {
-                case .ready:
-                    self?.connectedClients = self?.connections.count ?? 0
-                    print("✅ Client connected successfully! Total clients: \(self?.connectedClients ?? 0)")
-                case .cancelled:
-                    self?.connections.removeAll { $0 === connection }
-                    self?.connectedClients = self?.connections.count ?? 0
-                    print("👋 Client disconnected. Remaining clients: \(self?.connectedClients ?? 0)")
-                case .failed(let error):
-                    self?.connections.removeAll { $0 === connection }
-                    self?.connectedClients = self?.connections.count ?? 0
-                    print("❌ Client connection failed: \(error)")
-                default:
-                    print("Connection state: \(state)")
-                }
+            switch state {
+            case .ready:
+                print("✅ UDP Connection ready")
+            case .cancelled:
+                print("👋 UDP Connection cancelled")
+            case .failed(let error):
+                print("❌ UDP Connection failed: \(error)")
+            default:
+                print("UDP Connection state: \(state)")
             }
         }
         
@@ -345,16 +346,71 @@ class GameControllerServer: ObservableObject {
     }
     
     private func receiveMessage(from connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, isComplete, error in
+        connection.receiveMessage { [weak self] data, context, isComplete, error in
             if let data = data, let message = String(data: data, encoding: .utf8) {
+                // Get client address from the connection's remote endpoint
+                var clientAddress = "unknown"
+//                if let remoteEndpoint = connection.endpoint {
+                clientAddress = "\(connection.endpoint)"
+//                }
+                
+                // Update client tracking
+                self?.updateClientActivity(clientAddress)
+                
                 DispatchQueue.main.async {
                     self?.lastReceivedButton = message
-                    self?.messageCount += 1
+                    if message != "HEARTBEAT" {
+                        self?.messageCount += 1
+                    }
                 }
+                
+                print("📨 Received from \(clientAddress): \(message)")
             }
             
-            if !isComplete && error == nil {
-                self?.receiveMessage(from: connection)
+            if let error = error {
+                print("❌ UDP Receive error: \(error)")
+            }
+            
+            // Continue receiving messages
+            self?.receiveMessage(from: connection)
+        }
+    }
+    
+    private func updateClientActivity(_ clientAddress: String) {
+        let now = Date()
+        clientLastSeen[clientAddress] = now
+        
+        if !clientAddresses.contains(clientAddress) {
+            clientAddresses.insert(clientAddress)
+            print("📱 New client connected: \(clientAddress)")
+        }
+        
+        DispatchQueue.main.async {
+            self.activeClients = self.clientAddresses.count
+        }
+    }
+    
+    private func cleanupInactiveClients() {
+        let now = Date()
+        let timeout: TimeInterval = 10.0 // 10 seconds timeout
+        
+        var inactiveClients: [String] = []
+        
+        for (clientAddress, lastSeen) in clientLastSeen {
+            if now.timeIntervalSince(lastSeen) > timeout {
+                inactiveClients.append(clientAddress)
+            }
+        }
+        
+        for clientAddress in inactiveClients {
+            clientAddresses.remove(clientAddress)
+            clientLastSeen.removeValue(forKey: clientAddress)
+            print("⏰ Client timeout: \(clientAddress)")
+        }
+        
+        if !inactiveClients.isEmpty {
+            DispatchQueue.main.async {
+                self.activeClients = self.clientAddresses.count
             }
         }
     }
@@ -379,7 +435,7 @@ class GameControllerServer: ObservableObject {
             }
             
             // Very small delay for key press simulation
-            usleep(1000) // 1ms delay - much faster than before
+            usleep(1000) // 1ms delay - optimized for UDP
             
             // Key up
             if let keyUpEvent = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) {
